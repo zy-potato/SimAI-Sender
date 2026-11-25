@@ -45,6 +45,8 @@
 #include "ns3/mtp-interface.h"
 #endif
 #include <map>
+#include <set>
+#include <tuple>
 #include"SimCCL/mock/MockNcclQps.h"
 #include "SimCCL/mock/MockNcclLog.h"
 using namespace ns3;
@@ -71,7 +73,62 @@ map<std::pair<int, int>, int64_t> nodeHash;
 map<std::pair<int,std::pair<int,int>>,int> waiting_to_sent_callback;  
 map<std::pair<int,std::pair<int,int>>,int>waiting_to_notify_receiver;
 map<std::pair<int,std::pair<int,int>>,uint64_t>received_chunksize;  
-map<std::pair<int,std::pair<int,int>>,uint64_t>sent_chunksize;  
+map<std::pair<int,std::pair<int,int>>,uint64_t>sent_chunksize;
+
+// FIX-014: flows from FLOW_FILE run beside the workload and bypass astra-sim; the run ends when
+// the workload and every injected flow are done. The key set is fixed before the simulation starts.
+std::set<std::tuple<uint32_t, uint32_t, uint32_t>> injected_keys;  // (sport, src, dst)
+std::atomic<uint32_t> injected_left{0};
+std::atomic<bool> workload_done{false};
+std::atomic<bool> finishing{false};
+
+bool is_injected(Ptr<RdmaQueuePair> q, uint32_t sid, uint32_t did) {
+  return injected_keys.count(std::make_tuple((uint32_t)q->sport, sid, did)) > 0;
+}
+
+void finish_simulation() {
+  if (finishing.exchange(true))
+    return;
+  for (auto it = nodeHash.begin(); it != nodeHash.end(); it++) {
+    pair<int, int> p = it->first;
+    if (p.second == 0) {
+      std::cout << "sim_finish on sent, " << " Thread id: " << pthread_self() << std::endl;
+      cout << "All data sent from node " << p.first << " is " << it->second << "\n";
+    } else {
+      std::cout << "sim_finish on received, " << " Thread id: " << pthread_self() << std::endl;
+      cout << "All data received by node " << p.first << " is " << it->second << "\n";
+    }
+  }
+  finish_monitor("finished");
+  exit(0);
+}
+
+void start_injected_flows() {
+  for (const InjectedFlow &f : injected_flows) {
+    if (f.src >= node_num || f.dst >= node_num || n.Get(f.src)->GetNodeType() != 0 ||
+        n.Get(f.dst)->GetNodeType() != 0 || f.src == f.dst || f.size == 0 || f.pg > 7 || f.start_s < 0) {
+      std::cerr << "invalid flow in " << flow_file << ": " << f.src << " " << f.dst << " " << f.pg << " "
+                << f.dport << " " << f.size << " " << f.start_s << std::endl;
+      exit(-1);
+    }
+    uint16_t port = portNumber[f.src][f.dst]++;
+    injected_keys.insert(std::make_tuple((uint32_t)port, f.src, f.dst));
+    RdmaClientHelper clientHelper(
+        f.pg, serverAddress[f.src], serverAddress[f.dst], port, f.dport, f.size,
+        has_win ? (global_t == 1 ? maxBdp : pairBdp[n.Get(f.src)][n.Get(f.dst)]) : 0,
+        global_t == 1 ? maxRtt : pairRtt[f.src][f.dst], nullptr, nullptr, 0, f.src, f.dst);
+    ApplicationContainer appCon = clientHelper.Install(n.Get(f.src));
+    appCon.Start(Seconds(f.start_s));
+  }
+  if (injected_keys.size() != injected_flows.size()) {
+    std::cerr << "FLOW_FILE has more than 65536 flows between one pair" << std::endl;
+    exit(-1);
+  }
+  injected_left = injected_flows.size();
+  if (!injected_flows.empty())
+    std::cout << "injected flows: " << injected_flows.size() << std::endl;
+}
+
 bool is_sending_finished(int src,int dst,AstraSim::ncclFlowTag flowTag){
   int tag_id = flowTag.current_flow_id;
   if (waiting_to_sent_callback.count(
@@ -350,6 +407,18 @@ void notify_sender_packet_arrivered_receiver(int sender_node, int receiver_node,
   }
 }
 
+// FIX-009: QpComplete fires on the sender's LP when the last ACK arrives. The receiver's NIC and
+// astra-sim state belong to the receiver's LP, so that part runs there, at the same time stamp.
+// notify_size 0 means the chunk still has QPs in flight.
+void receiver_qp_finish(uint32_t sid, uint32_t did, uint16_t pg, uint16_t sport,
+                        uint64_t notify_size, AstraSim::ncclFlowTag flowTag) {
+  Ptr<RdmaDriver> rdma = n.Get(did)->GetObject<RdmaDriver>();
+  rdma->m_rdma->DeleteRxQp(serverAddress[sid].Get(), pg, sport);
+  if (notify_size > 0) {
+    notify_receiver_receive_data(sid, did, notify_size, flowTag);
+  }
+}
+
 void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
   uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
   uint64_t base_rtt = pairRtt[sid][did], b = pairBw[sid][did];
@@ -364,15 +433,20 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
           (Simulator::Now() - q->startTime).GetTimeStep(), standalone_fct);
   fflush(fout);
 
+  if (is_injected(q, sid, did)) {
+    Simulator::ScheduleWithContext(did, Time(0), &receiver_qp_finish, sid, did, q->m_pg, q->sport,
+                                   (uint64_t)0, AstraSim::ncclFlowTag());
+    if (--injected_left == 0 && workload_done)
+      finish_simulation();
+    return;
+  }
+
   AstraSim::ncclFlowTag flowTag;
-  uint64_t notify_size;
+  uint64_t notify_size = 0;
   {
     #ifdef NS3_MTP
     MtpInterface::explicitCriticalSection cs;
     #endif
-    Ptr<Node> dstNode = n.Get(did);
-    Ptr<RdmaDriver> rdma = dstNode->GetObject<RdmaDriver>();
-    rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
     MockNcclLog* NcclLog = MockNcclLog::getInstance();
     NcclLog->writeLog(NcclLogLevel::DEBUG,"qp finish, src:  %d did:  %d port:  %d total bytes:  %llu at the tick:  %d",sid,did,q->sport,q->m_size,AstraSim::Sys::boostedTick());
     if (sender_src_port_map.find(make_pair(q->sport, make_pair(sid, did))) ==
@@ -383,23 +457,22 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
     flowTag = sender_src_port_map[make_pair(q->sport, make_pair(sid, did))];
     sender_src_port_map.erase(make_pair(q->sport, make_pair(sid, did)));
     received_chunksize[std::make_pair(flowTag.current_flow_id,std::make_pair(sid,did))]+=q->m_size;
-    if(!is_receive_finished(sid,did,flowTag)) {
-      #ifdef NS3_MTP
-      cs.ExitSection();
-      #endif
-      return; 
+    if(is_receive_finished(sid,did,flowTag)) {
+      notify_size = received_chunksize[std::make_pair(flowTag.current_flow_id,std::make_pair(sid,did))];
+      received_chunksize.erase(std::make_pair(flowTag.current_flow_id,std::make_pair(sid,did)));
     }
-    notify_size = received_chunksize[std::make_pair(flowTag.current_flow_id,std::make_pair(sid,did))];
-    received_chunksize.erase(std::make_pair(flowTag.current_flow_id,std::make_pair(sid,did)));    
     #ifdef NS3_MTP
     cs.ExitSection();
     #endif
   }
-  notify_receiver_receive_data(sid, did, notify_size, flowTag);
+  Simulator::ScheduleWithContext(did, Time(0), &receiver_qp_finish, sid, did, q->m_pg, q->sport,
+                                 notify_size, flowTag);
 }
 
 void send_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
   uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
+  if (is_injected(q, sid, did))
+    return;
   AstraSim::ncclFlowTag flowTag;
   MockNcclLog* NcclLog = MockNcclLog::getInstance();
   NcclLog->writeLog(NcclLogLevel::DEBUG,"[Packet sent from NIC] send finish, src:  %d did:  %d port:  %d srcip  %d dstip  %d total bytes:  %llu at the tick:  %d",sid,did,q->sport,q->sip,q->dip,q->m_size,AstraSim::Sys::boostedTick());
@@ -433,6 +506,7 @@ int main1(string network_topo,string network_conf) {
     return -1;
   SetConfig();
   SetupNetwork(qp_finish,send_finish);
+  start_injected_flows();
   if (enable_monitor)
     schedule_monitor();
 

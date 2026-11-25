@@ -76,6 +76,18 @@ bool multi_rate = true;
 bool sample_feedback = false;
 double pint_log_base = 1.05;
 double pint_prob = 1.0;
+// FIX-011: ns-3 run number of all random streams; 1 is the ns-3 default
+int64_t seed = 1;
+// FIX-010: explicit per-node RNG streams (stream + node id)
+const int64_t ECN_STREAM_BASE = 1 << 20;
+const int64_t PINT_SWITCH_STREAM_BASE = 2 << 20;
+const int64_t PINT_NIC_STREAM_BASE = 3 << 20;
+// FIX-013: link error models, stream + 2 * link index + direction
+const int64_t ERROR_STREAM_BASE = 4 << 20;
+// FIX-011: SEED 1 keeps the original ECMP seed (the switch id); other seeds map ids one-to-one
+uint32_t ecmp_seed(uint32_t id) {
+  return id ^ (uint32_t)((seed - 1) * 0x9E3779B9u);
+}
 double u_target = 0.95;
 uint32_t int_multi = 1;
 bool rate_bound = true;
@@ -150,6 +162,13 @@ struct FlowInput {
 
 FlowInput flow_input = {0};
 uint32_t flow_num;
+// FIX-014: point-to-point flows from FLOW_FILE, one per line: src dst pg dport size_bytes start_s
+struct InjectedFlow {
+  uint32_t src, dst, pg, dport;
+  uint64_t size;
+  double start_s;
+};
+std::vector<InjectedFlow> injected_flows;
 Ipv4Address node_id_to_ip(uint32_t id) {
   return Ipv4Address(0x0b000001 + ((id / 256) * 0x00010000) +
                      ((id % 256) * 0x00000100));
@@ -725,6 +744,8 @@ bool ReadConf(string network_topo,string network_conf) {
         conf >> pint_log_base;
       } else if (key.compare("PINT_PROB") == 0) {
         conf >> pint_prob;
+      } else if (key.compare("SEED") == 0) {
+        conf >> seed;
       }
       fflush(stdout);
     }
@@ -734,6 +755,13 @@ bool ReadConf(string network_topo,string network_conf) {
 
 void SetConfig() {
   bool dynamicth = use_dynamic_pfc_threshold;
+
+  if (seed < 1) {
+    std::cerr << "SEED must be a positive integer, got: " << seed << std::endl;
+    exit(-1);
+  }
+  RngSeedManager::SetRun(seed);
+  std::cout << "seed: " << seed << std::endl;
 
   Config::SetDefault("ns3::QbbNetDevice::PauseTime", UintegerValue(pause_time));
   Config::SetDefault("ns3::QbbNetDevice::QcnEnabled", BooleanValue(enable_qcn));
@@ -768,6 +796,15 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
   topof >> node_num >> gpus_per_server >> nvswitch_num >> switch_num >>
       link_num >> gpu_type_str;
   flowf >> flow_num;
+  for (uint32_t i = 0; i < flow_num; i++) {
+    InjectedFlow f;
+    flowf >> f.src >> f.dst >> f.pg >> f.dport >> f.size >> f.start_s;
+    injected_flows.push_back(f);
+  }
+  if (flow_num > 0 && !flowf) {
+    std::cerr << "cannot read " << flow_num << " flows from " << flow_file << std::endl;
+    exit(-1);
+  }
   tracef >> trace_num;
   if(gpu_type_str == "A100"){
     gpu_type = GPUType::A100;
@@ -822,13 +859,6 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 
   NS_LOG_INFO("Create channels.");
 
-  Ptr<RateErrorModel> rem = CreateObject<RateErrorModel>();
-  Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
-  rem->SetRandomVariable(uv);
-  uv->SetStream(50);
-  rem->SetAttribute("ErrorRate", DoubleValue(error_rate_per_link));
-  rem->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
-
   FILE *pfc_file = open_output_file(pfc_output_file, "PFC output");
   fprintf(pfc_file, "time_ns,node,node_type,port,type\n");
   fflush(pfc_file);
@@ -845,21 +875,23 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     qbb.SetDeviceAttribute("DataRate", StringValue(data_rate));
     qbb.SetChannelAttribute("Delay", StringValue(link_delay));
 
-    if (error_rate > 0) {
-      Ptr<RateErrorModel> rem = CreateObject<RateErrorModel>();
-      Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
-      rem->SetRandomVariable(uv);
-      uv->SetStream(50);
-      rem->SetAttribute("ErrorRate", DoubleValue(error_rate));
-      rem->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
-      qbb.SetDeviceAttribute("ReceiveErrorModel", PointerValue(rem));
-    } else {
-      qbb.SetDeviceAttribute("ReceiveErrorModel", PointerValue(rem));
-    }
-
     fflush(stdout);
 
     NetDeviceContainer d = qbb.Install(snode, dnode);
+    // FIX-013: each receiving device gets its own error model and RNG stream; the link's rate
+    // overrides ERROR_RATE_PER_LINK, and rate 0 installs no model
+    double rate = error_rate > 0 ? error_rate : error_rate_per_link;
+    if (rate > 0) {
+      for (uint32_t k = 0; k < 2; k++) {
+        Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
+        uv->SetStream(ERROR_STREAM_BASE + 2 * i + k);
+        Ptr<RateErrorModel> rem = CreateObject<RateErrorModel>();
+        rem->SetRandomVariable(uv);
+        rem->SetAttribute("ErrorRate", DoubleValue(rate));
+        rem->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+        DynamicCast<QbbNetDevice>(d.Get(k))->SetReceiveErrorModel(rem);
+      }
+    }
     if (snode->GetNodeType() == 0 || snode->GetNodeType() == 2) {
       Ptr<Ipv4> ipv4 = snode->GetObject<Ipv4>();
       ipv4->AddInterface(d.Get(0));
@@ -908,8 +940,12 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
   }
 
   nic_rate = get_nic_rate(n);
+  if (node_num >= ECN_STREAM_BASE) {
+    std::cerr << "too many nodes for the per-node RNG streams: " << node_num << std::endl;
+    exit(-1);
+  }
   for (uint32_t i = 0; i < node_num; i++) {
-    if (n.Get(i)->GetNodeType() == 1) { 
+    if (n.Get(i)->GetNodeType() == 1) {
       Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
       uint32_t shift = 3; 
 
@@ -938,6 +974,9 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
       sw->m_mmu->ConfigNPort(sw->GetNDevices() - 1);
       sw->m_mmu->ConfigBufferSize(buffer_size * 1024 * 1024);
       sw->m_mmu->node_id = sw->GetId();
+      sw->m_mmu->SetEcnStream(ECN_STREAM_BASE + sw->GetId());
+      sw->SetPintStream(PINT_SWITCH_STREAM_BASE + sw->GetId());
+      sw->SetEcmpSeed(ecmp_seed(sw->GetId()));
     } else if(n.Get(i)->GetNodeType() == 2){ 
 			Ptr<NVSwitchNode> sw = DynamicCast<NVSwitchNode>(n.Get(i));
       uint32_t shift = 3; 
@@ -958,6 +997,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 			sw->m_mmu->ConfigNPort(sw->GetNDevices()-1);
 			sw->m_mmu->ConfigBufferSize(buffer_size* 1024 * 1024);
 			sw->m_mmu->node_id = sw->GetId();
+			sw->SetEcmpSeed(ecmp_seed(sw->GetId()));
 		}
   }
 
@@ -995,6 +1035,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
                            DataRateValue(DataRate(dctcp_rate_ai)));
       rdmaHw->SetAttribute("GPUsPerServer", UintegerValue(gpus_per_server));
       rdmaHw->SetPintSmplThresh(pint_prob);
+      rdmaHw->SetPintStream(PINT_NIC_STREAM_BASE + i);
       rdmaHw->SetAttribute("TotalPauseTimes",
                            UintegerValue(nic_total_pause_time));
       Ptr<RdmaDriver> rdma = CreateObject<RdmaDriver>();

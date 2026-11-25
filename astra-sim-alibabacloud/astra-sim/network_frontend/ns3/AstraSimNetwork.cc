@@ -72,20 +72,10 @@ public:
   ~ASTRASimNetwork() {}
   int sim_comm_size(AstraSim::sim_comm comm, int *size) { return 0; }
   int sim_finish() {
-    for (auto it = nodeHash.begin(); it != nodeHash.end(); it++) {
-      pair<int, int> p = it->first;
-      if (p.second == 0) {
-        std::cout << "sim_finish on sent, " << " Thread id: " << pthread_self() << std::endl;
-        cout << "All data sent from node " << p.first << " is " << it->second
-             << "\n";
-      } else {
-        std::cout << "sim_finish on received, " << " Thread id: " << pthread_self() << std::endl;
-        cout << "All data received by node " << p.first << " is " << it->second
-             << "\n";
-      }
-    }
-    finish_monitor("finished");
-    exit(0);
+    // FIX-014: flows from FLOW_FILE may still be running; the last one ends the run
+    workload_done = true;
+    if (injected_left == 0)
+      finish_simulation();
     return 0;
   }
   double sim_time_resolution() { return 0; }
