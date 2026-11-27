@@ -66,7 +66,8 @@ function compile {
     cp -r "$MOCK_SRC"/* "${NS3_APPLICATION}"/SimCCL/mock/
     cd "${NS3_DIR}/simulation"
     CC='gcc' CXX='g++' 
-    ./ns3 configure -d debug --enable-mtp
+    # release (-O3) with NS_ASSERT kept: same output as debug, about 6x faster (FIX-016)
+    ./ns3 configure -d release --enable-asserts --enable-mtp
     ./ns3 build
 
     cd "${SCRIPT_DIR:?}"

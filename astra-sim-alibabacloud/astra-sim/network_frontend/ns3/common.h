@@ -101,6 +101,8 @@ uint32_t link_down_A = 0, link_down_B = 0;
 uint32_t enable_trace = 1;
 
 uint32_t buffer_size = 16;
+// FIX-017: when > 0, a switch's buffer is the sum of its port rates times this (MB per Tbps)
+double buffer_mb_per_tbps = 0;
 
 uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server;
 GPUType gpu_type;
@@ -130,7 +132,7 @@ std::ifstream topof, flowf, tracef;
 
 NodeContainer n;
 
-uint64_t nic_rate;
+uint64_t nic_rate, nvlink_rate;
 
 uint64_t maxRtt, maxBdp;
 
@@ -533,12 +535,25 @@ void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
   }
 }
 
-uint64_t get_nic_rate(NodeContainer &n) {
-  for (uint32_t i = 0; i < n.GetN(); i++)
-    if (n.Get(i)->GetNodeType() == 0)
-      return DynamicCast<QbbNetDevice>(n.Get(i)->GetDevice(1))
-          ->GetDataRate()
-          .GetBitRate();
+// FIX-015: rate of the hosts' links to switches of the given type (1: NIC, 2: NVLink); the PFC
+// threshold of a port faster than this is raised. Device 1 of a host is usually its NVLink.
+uint64_t get_host_link_rate(NodeContainer &n, uint32_t peer_type) {
+  uint64_t rate = 0;
+  for (uint32_t i = 0; i < n.GetN(); i++) {
+    if (n.Get(i)->GetNodeType() != 0)
+      continue;
+    for (auto &it : nbr2if[n.Get(i)]) {
+      if (it.first->GetNodeType() != peer_type)
+        continue;
+      if (rate != 0 && it.second.bw != rate) {
+        std::cerr << "hosts' links to node type " << peer_type << " have different rates: " << rate
+                  << " and " << it.second.bw << std::endl;
+        exit(-1);
+      }
+      rate = it.second.bw;
+    }
+  }
+  return rate;
 }
 
 bool ReadConf(string network_topo,string network_conf) {
@@ -708,6 +723,8 @@ bool ReadConf(string network_topo,string network_conf) {
         }
       } else if (key.compare("BUFFER_SIZE") == 0) {
         conf >> buffer_size;
+      } else if (key.compare("BUFFER_MB_PER_TBPS") == 0) {
+        conf >> buffer_mb_per_tbps;
       } else if (key.compare("QLEN_MON_FILE") == 0){
 				conf >> qlen_mon_file;
 			}else if(key.compare("BW_MON_FILE") == 0){
@@ -939,7 +956,12 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
                                     DynamicCast<QbbNetDevice>(d.Get(1))));
   }
 
-  nic_rate = get_nic_rate(n);
+  nic_rate = get_host_link_rate(n, 1);
+  nvlink_rate = get_host_link_rate(n, 2);
+  if (nic_rate == 0) {
+    std::cerr << "no host is connected to a switch" << std::endl;
+    exit(-1);
+  }
   if (node_num >= ECN_STREAM_BASE) {
     std::cerr << "too many nodes for the per-node RNG streams: " << node_num << std::endl;
     exit(-1);
@@ -972,7 +994,18 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
         }
       }
       sw->m_mmu->ConfigNPort(sw->GetNDevices() - 1);
-      sw->m_mmu->ConfigBufferSize(buffer_size * 1024 * 1024);
+      uint64_t switch_buffer = (uint64_t)buffer_size * 1024 * 1024;
+      if (buffer_mb_per_tbps > 0) {
+        double tbps = 0;
+        for (uint32_t j = 1; j < sw->GetNDevices(); j++)
+          tbps += DynamicCast<QbbNetDevice>(sw->GetDevice(j))->GetDataRate().GetBitRate() / 1e12;
+        switch_buffer = (uint64_t)(tbps * buffer_mb_per_tbps * 1024 * 1024);
+      }
+      if (switch_buffer > UINT32_MAX) {
+        std::cerr << "switch " << sw->GetId() << ": buffer of " << switch_buffer << " bytes does not fit the MMU" << std::endl;
+        exit(-1);
+      }
+      sw->m_mmu->ConfigBufferSize(switch_buffer);
       sw->m_mmu->node_id = sw->GetId();
       sw->m_mmu->SetEcnStream(ECN_STREAM_BASE + sw->GetId());
       sw->SetPintStream(PINT_SWITCH_STREAM_BASE + sw->GetId());
@@ -989,7 +1022,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
         uint32_t headroom = rate * delay / 8 / 1000000000 * 3;
         sw->m_mmu->ConfigHdrm(j, headroom);
         sw->m_mmu->pfc_a_shift[j] = shift;
-        while (rate > nic_rate && sw->m_mmu->pfc_a_shift[j] > 0) {
+        while (rate > nvlink_rate && sw->m_mmu->pfc_a_shift[j] > 0) {
           sw->m_mmu->pfc_a_shift[j]--;
           rate /= 2;
         }
